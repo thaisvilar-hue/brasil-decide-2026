@@ -154,7 +154,7 @@ async function refresh(){
  }finally{btn.disabled=false;btn.textContent='↻ Atualizar'}
 }
 $('refresh').onclick=refresh;
-$('demo').onclick=()=>{
+if ($('demo')) $('demo').onclick=()=>{
  demo=!demo;$('demo').textContent=demo?'Sair da demonstração':'Visualizar demonstração';
  if(demo){data=sample();$('feedback').textContent='Modo demonstração: todos os números são fictícios.';paint()}
  else refresh();
