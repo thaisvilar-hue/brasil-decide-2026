@@ -1,13 +1,24 @@
 
-const BASE = "https://resultados.tse.jus.br/oficial/ele2026/6258/dados";
+/*
+ * BRASIL DECIDE 2026
+ * API de resultados presidenciais — 2º turno
+ *
+ * Fonte: arquivos JSON do TSE.
+ * Não utiliza votos fictícios.
+ */
 
-const UFS = "AC AL AP AM BA CE DF ES GO MA MT MS MG PA PB PR PE PI RJ RN RS RO RR SC SP SE TO".split(" ");
+const BASE =
+  "https://resultados.tse.jus.br/oficial/ele2026/6258/dados";
 
-function unavailable(message) {
+const UFS =
+  "AC AL AP AM BA CE DF ES GO MA MT MS MG PA PB PR PE PI RJ RN RS RO RR SC SP SE TO"
+    .split(" ");
+
+function unavailable(message, metadata = {}) {
   return {
     status: "unavailable",
     source: "TSE — apuração presidencial 2026",
-    updatedAt: null,
+    updatedAt: metadata.updatedAt ?? null,
     national: null,
     states: [],
     municipalities: [],
@@ -16,10 +27,61 @@ function unavailable(message) {
   };
 }
 
-function readVotes(json) {
-  const groups = json?.carg || [];
+// Converte percentuais brasileiros: "42,60" -> 42.6
+function parsePercent(value) {
+  if (value == null || value === "") return null;
 
-  for (const office of groups) {
+  const number = Number(
+    String(value).replace(",", ".")
+  );
+
+  if (
+    !Number.isFinite(number) ||
+    number < 0 ||
+    number > 100
+  ) {
+    return null;
+  }
+
+  return number;
+}
+
+// Interpreta a data e a hora fornecidas pelo TSE.
+function parseOfficialDate(json) {
+  const date = json?.dg;
+  const time = json?.hg;
+
+  if (!date || !time) return null;
+
+  const match = String(date).match(
+    /^(\d{2})\/(\d{2})\/(\d{4})$/
+  );
+
+  if (!match) return null;
+
+  const [, day, month, year] = match;
+
+  const iso =
+    `${year}-${month}-${day}T${time}-03:00`;
+
+  const timestamp = new Date(iso);
+
+  return Number.isNaN(timestamp.getTime())
+    ? null
+    : timestamp.toISOString();
+}
+
+// Extrai votos dos candidatos 13 e 22.
+function readVotes(json) {
+  const offices = Array.isArray(json?.carg)
+    ? json.carg
+    : [];
+
+  for (const office of offices) {
+    if (String(office.cd ?? "") !== "1") {
+      continue;
+    }
+
     const candidates = [];
 
     for (const coalition of office.agr || []) {
@@ -29,50 +91,78 @@ function readVotes(json) {
     }
 
     const findCandidate = number =>
-      candidates.find(c =>
-        String(c.n ?? c.nr ?? c.numero) === number
+      candidates.find(candidate =>
+        String(
+          candidate.n ??
+          candidate.nr ??
+          candidate.numero
+        ) === number
       );
 
     const lula = findCandidate("13");
     const flavio = findCandidate("22");
 
-    if (!lula || !flavio) continue;
+    if (!lula || !flavio) return null;
 
-    const a = Number(lula.vap);
-    const b = Number(flavio.vap);
+    const lulaVotes = Number(lula.vap);
+    const flavioVotes = Number(flavio.vap);
 
     if (
-      Number.isSafeInteger(a) &&
-      Number.isSafeInteger(b) &&
-      a >= 0 &&
-      b >= 0
+      !Number.isSafeInteger(lulaVotes) ||
+      !Number.isSafeInteger(flavioVotes) ||
+      lulaVotes < 0 ||
+      flavioVotes < 0
     ) {
-      return { lula: a, bolsonaro: b };
+      return null;
     }
+
+    return {
+      lula: lulaVotes,
+      bolsonaro: flavioVotes
+    };
   }
 
   return null;
 }
 
+// Consulta um arquivo oficial.
 async function load(scope) {
   const uf = scope.toLowerCase();
-  const file = `${uf}-c0001-e006258-u.json`;
+
+  const filename =
+    `${uf}-c0001-e006258-u.json`;
 
   const response = await fetch(
-    `${BASE}/${uf}/${file}`,
+    `${BASE}/${uf}/${filename}`,
     {
-      headers: { Accept: "application/json" },
+      headers: {
+        Accept: "application/json"
+      },
       signal: AbortSignal.timeout(8000)
     }
   );
 
   if (!response.ok) {
-    throw new Error(`${scope}: HTTP ${response.status}`);
+    throw new Error(
+      `${scope}: HTTP ${response.status}`
+    );
   }
 
-  return response.json();
+  const json = await response.json();
+
+  if (
+    String(json?.ele) !== "6258" ||
+    String(json?.t) !== "2"
+  ) {
+    throw new Error(
+      `${scope}: identificação eleitoral inesperada`
+    );
+  }
+
+  return json;
 }
 
+// Endpoint /api/results
 export default async function handler(req, res) {
   res.setHeader(
     "Cache-Control",
@@ -80,46 +170,97 @@ export default async function handler(req, res) {
   );
 
   try {
-    const br = await load("br");
-    const national = readVotes(br);
+    const nationalJson = await load("br");
 
-    if (!national || national.lula + national.bolsonaro === 0) {
+    const nationalVotes =
+      readVotes(nationalJson);
+
+    const progress =
+      parsePercent(nationalJson?.pst);
+
+    const updatedAt =
+      parseOfficialDate(nationalJson);
+
+    if (!nationalVotes) {
       return res.status(200).json(
-        unavailable("Aguardando votos oficiais validados do TSE.")
+        unavailable(
+          "O arquivo oficial foi encontrado, mas os votos ainda não puderam ser validados.",
+          { updatedAt }
+        )
       );
     }
 
-    const responses = await Promise.allSettled(UFS.map(load));
+    const totalVotes =
+      nationalVotes.lula +
+      nationalVotes.bolsonaro;
 
-    const states = responses.flatMap((result, index) => {
-      if (result.status !== "fulfilled") return [];
+    // Sem votos: não apresentar percentuais
+    // de candidatos nem resultados fictícios.
+    if (totalVotes === 0) {
+      return res.status(200).json(
+        unavailable(
+          "Aguardando votos oficiais. O arquivo do TSE ainda apresenta zero votos para os candidatos.",
+          { updatedAt }
+        )
+      );
+    }
 
-      const votes = readVotes(result.value);
+    // Consultar os estados somente quando
+    // houver votos nacionais validados.
+    const responses = await Promise.allSettled(
+      UFS.map(uf => load(uf))
+    );
 
-      return votes
-        ? [{
-            uf: UFS[index],
-            name: UFS[index],
-            ...votes,
-            progress: null
-          }]
-        : [];
-    });
+    const states = responses.flatMap(
+      (result, index) => {
+        if (result.status !== "fulfilled") {
+          return [];
+        }
+
+        const votes = readVotes(result.value);
+
+        if (!votes) return [];
+
+        return [{
+          uf: UFS[index],
+          name: UFS[index],
+          ...votes,
+          progress: parsePercent(
+            result.value?.pst
+          )
+        }];
+      }
+    );
 
     return res.status(200).json({
       status: "live",
-      source: "TSE — apuração presidencial 2026",
-      updatedAt: new Date().toISOString(),
-      national: { ...national, progress: null },
+
+      source:
+        "TSE — apuração presidencial 2026, 2º turno",
+
+      updatedAt,
+
+      national: {
+        ...nationalVotes,
+        progress
+      },
+
       states,
+
       municipalities: [],
+
       abroad: [],
-      message: "Resultados consultados na fonte oficial."
+
+      message:
+        "Dados oficiais consultados. Municípios e exterior ainda não integrados."
     });
 
   } catch (error) {
     return res.status(200).json(
-      unavailable("Fonte oficial indisponível: " + error.message)
+      unavailable(
+        "Não foi possível consultar ou validar a fonte oficial: " +
+        error.message
+      )
     );
   }
 }
